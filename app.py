@@ -144,6 +144,29 @@ class PreservationStore:
                     detail TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS legal_holds(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    archive_id INTEGER NOT NULL REFERENCES archives(id),
+                    reason TEXT NOT NULL,
+                    registered_by TEXT NOT NULL REFERENCES users(id),
+                    registered_at TEXT NOT NULL,
+                    revoked_by TEXT REFERENCES users(id),
+                    revoked_at TEXT,
+                    revoke_reason TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS destruction_requests(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    archive_id INTEGER NOT NULL REFERENCES archives(id),
+                    requested_by TEXT NOT NULL REFERENCES users(id),
+                    reason TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved')),
+                    requested_at TEXT NOT NULL,
+                    decided_by TEXT REFERENCES users(id),
+                    decided_at TEXT,
+                    destroyed_at TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_destruction_pending
+                    ON destruction_requests(archive_id) WHERE status='pending';
                 """
             )
 
@@ -187,6 +210,20 @@ class PreservationStore:
             "INSERT INTO audit_log(archive_id,actor_id,action,detail,created_at) VALUES(?,?,?,?,?)",
             (archive_id, actor, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), now()),
         )
+
+    def _active_holds(self, conn, archive_id: int) -> list[sqlite3.Row]:
+        return conn.execute(
+            "SELECT * FROM legal_holds WHERE archive_id=? AND revoked_at IS NULL ORDER BY id",
+            (archive_id,),
+        ).fetchall()
+
+    def _ensure_not_destroyed(self, conn, archive_id: int) -> None:
+        approved = conn.execute(
+            "SELECT 1 FROM destruction_requests WHERE archive_id=? AND status='approved' LIMIT 1",
+            (archive_id,),
+        ).fetchone()
+        if approved:
+            raise BusinessError("档案已销毁，不能再变更内容", 409, "archive_destroyed")
 
     def create_archive(self, user_id: str, name: str, retention_until: str, restricted: bool = True) -> dict:
         name = name.strip()
@@ -238,6 +275,7 @@ class PreservationStore:
         with self.connect() as conn:
             actor = self._user(conn, actor_id, {"owner", "archivist"})
             self._access(conn, archive_id, actor, require_write=True)
+            self._ensure_not_destroyed(conn, archive_id)
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 version_no = conn.execute(
@@ -273,6 +311,7 @@ class PreservationStore:
             if not version:
                 raise BusinessError("档案版本不存在", 404, "not_found")
             self._access(conn, version["archive_id"], actor, require_write=True)
+            self._ensure_not_destroyed(conn, version["archive_id"])
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 cur = conn.execute(
@@ -374,6 +413,7 @@ class PreservationStore:
                 raise BusinessError("副本不存在", 404, "not_found")
             version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (copy["version_id"],)).fetchone()
             self._access(conn, version["archive_id"], user, require_write=True)
+            self._ensure_not_destroyed(conn, version["archive_id"])
             row = conn.execute("SELECT content FROM copy_files WHERE copy_id=? AND path=?", (copy_id, path)).fetchone()
             if not row:
                 raise BusinessError("副本文件不存在", 404, "not_found")
@@ -390,6 +430,7 @@ class PreservationStore:
             if not source_version:
                 raise BusinessError("源档案版本不存在", 404, "not_found")
             self._access(conn, source_version["archive_id"], actor, require_write=True)
+            self._ensure_not_destroyed(conn, source_version["archive_id"])
             source = conn.execute(
                 "SELECT * FROM archive_files WHERE version_id=? AND path=?", (version_id, source_path)
             ).fetchone()
@@ -430,6 +471,130 @@ class PreservationStore:
                 conn.rollback()
                 raise
 
+    def register_hold(self, actor_id: str, archive_id: int, reason: str) -> dict:
+        reason = reason.strip()
+        if not reason:
+            raise BusinessError("保全事由不能为空", 422, "hold_reason_required")
+        with self.connect() as conn:
+            actor = self._user(conn, actor_id, {"owner", "archivist"})
+            self._access(conn, archive_id, actor, require_write=True)
+            cur = conn.execute(
+                "INSERT INTO legal_holds(archive_id,reason,registered_by,registered_at) VALUES(?,?,?,?)",
+                (archive_id, reason, actor_id, now()),
+            )
+            hold_id = cur.lastrowid
+            self._audit(conn, archive_id, actor_id, "hold.register", {"hold_id": hold_id, "reason": reason})
+            return {"id": hold_id, "archive_id": archive_id, "reason": reason, "state": "active"}
+
+    def revoke_hold(self, actor_id: str, hold_id: int, revoke_reason: str = "") -> dict:
+        with self.connect() as conn:
+            actor = self._user(conn, actor_id, {"owner", "archivist"})
+            hold = conn.execute("SELECT * FROM legal_holds WHERE id=?", (hold_id,)).fetchone()
+            if not hold:
+                raise BusinessError("保全记录不存在", 404, "not_found")
+            self._access(conn, hold["archive_id"], actor, require_write=True)
+            if hold["revoked_at"] is not None:
+                raise BusinessError("该保全已撤销", 409, "hold_already_revoked")
+            conn.execute(
+                "UPDATE legal_holds SET revoked_by=?,revoked_at=?,revoke_reason=? WHERE id=?",
+                (actor_id, now(), revoke_reason.strip(), hold_id),
+            )
+            self._audit(
+                conn, hold["archive_id"], actor_id, "hold.revoke",
+                {"hold_id": hold_id, "revoke_reason": revoke_reason.strip()},
+            )
+            return {"id": hold_id, "archive_id": hold["archive_id"], "state": "revoked"}
+
+    def request_destruction(self, actor_id: str, archive_id: int, reason: str = "") -> dict:
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                actor = self._user(conn, actor_id, {"owner", "archivist"})
+                self._access(conn, archive_id, actor, require_write=True)
+                archive = conn.execute("SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
+                self._ensure_not_destroyed(conn, archive_id)
+                if date.today() < date.fromisoformat(archive["retention_until"]):
+                    raise BusinessError("保留期限未到，不受理销毁申请", 422, "retention_active")
+                if self._active_holds(conn, archive_id):
+                    raise BusinessError("档案存在生效保全，不能申请销毁", 409, "active_hold")
+                try:
+                    cur = conn.execute(
+                        "INSERT INTO destruction_requests(archive_id,requested_by,reason,requested_at) VALUES(?,?,?,?)",
+                        (archive_id, actor_id, reason.strip(), now()),
+                    )
+                except sqlite3.IntegrityError:
+                    raise BusinessError("已有待审批的销毁申请", 409, "destruction_pending")
+                request_id = cur.lastrowid
+                self._audit(
+                    conn, archive_id, actor_id, "destruction.request",
+                    {"request_id": request_id, "reason": reason.strip()},
+                )
+                return {"id": request_id, "archive_id": archive_id, "status": "pending", "requested_by": actor_id}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def approve_destruction(self, actor_id: str, request_id: int) -> dict:
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                actor = self._user(conn, actor_id, {"auditor"})
+                req = conn.execute("SELECT * FROM destruction_requests WHERE id=?", (request_id,)).fetchone()
+                if not req:
+                    raise BusinessError("销毁申请不存在", 404, "not_found")
+                archive_id = req["archive_id"]
+                # 审计员必须能访问该档案（由所有者授予 read 权限）
+                self._access(conn, archive_id, actor)
+                if req["status"] != "pending":
+                    raise BusinessError("该销毁申请已处理", 409, "destruction_decided")
+                archive = conn.execute("SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
+                if date.today() < date.fromisoformat(archive["retention_until"]):
+                    raise BusinessError("保留期限未到，不能批准销毁", 422, "retention_active")
+                # 申请之后才登记的保全同样阻断审批
+                active_holds = self._active_holds(conn, archive_id)
+                if active_holds:
+                    raise BusinessError(
+                        "审批期间档案存在生效保全，销毁被拒绝", 409, "active_hold_during_review"
+                    )
+                version_ids = [r["id"] for r in conn.execute(
+                    "SELECT id FROM archive_versions WHERE archive_id=?", (archive_id,)
+                ).fetchall()]
+                cleared_files = cleared_copies = 0
+                for version_id in version_ids:
+                    copy_ids = [r["id"] for r in conn.execute(
+                        "SELECT id FROM copies WHERE version_id=?", (version_id,)
+                    ).fetchall()]
+                    if copy_ids:
+                        cleared_copies += len(copy_ids)
+                        conn.execute(
+                            f"DELETE FROM copy_files WHERE copy_id IN ({','.join('?' for _ in copy_ids)})",
+                            copy_ids,
+                        )
+                        conn.execute(
+                            f"DELETE FROM copies WHERE id IN ({','.join('?' for _ in copy_ids)})",
+                            copy_ids,
+                        )
+                    cleared_files += conn.execute(
+                        "DELETE FROM archive_files WHERE version_id=?", (version_id,)
+                    ).rowcount
+                timestamp = now()
+                conn.execute(
+                    "UPDATE destruction_requests SET status='approved',decided_by=?,decided_at=?,destroyed_at=? WHERE id=?",
+                    (actor_id, timestamp, timestamp, request_id),
+                )
+                self._audit(
+                    conn, archive_id, actor_id, "destruction.approve",
+                    {"request_id": request_id, "cleared_files": cleared_files,
+                     "cleared_copies": cleared_copies, "destroyed_at": timestamp},
+                )
+                return {
+                    "id": request_id, "archive_id": archive_id, "status": "approved",
+                    "decided_by": actor_id, "cleared_files": cleared_files, "cleared_copies": cleared_copies,
+                }
+            except Exception:
+                conn.rollback()
+                raise
+
     def archive_status(self, user_id: str, archive_id: int) -> dict:
         with self.connect() as conn:
             user = self._user(conn, user_id, {"owner", "archivist", "auditor"})
@@ -437,9 +602,26 @@ class PreservationStore:
             archive = conn.execute("SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
             versions = conn.execute("SELECT id,version,state,created_at FROM archive_versions WHERE archive_id=? ORDER BY version", (archive_id,)).fetchall()
             deadline = date.fromisoformat(archive["retention_until"])
+            holds = [dict(r) for r in conn.execute(
+                "SELECT * FROM legal_holds WHERE archive_id=? ORDER BY id", (archive_id,)
+            ).fetchall()]
+            requests = [dict(r) for r in conn.execute(
+                "SELECT * FROM destruction_requests WHERE archive_id=? ORDER BY id", (archive_id,)
+            ).fetchall()]
+            if any(r["status"] == "approved" for r in requests):
+                lifecycle = "destroyed"
+            elif any(r["status"] == "pending" for r in requests):
+                lifecycle = "destruction_pending"
+            else:
+                lifecycle = "active"
             return {
                 "archive": dict(archive),
                 "days_remaining": (deadline - date.today()).days,
+                "retention_expired": date.today() >= deadline,
+                "lifecycle": lifecycle,
+                "active_hold_count": sum(1 for h in holds if h["revoked_at"] is None),
+                "holds": holds,
+                "destruction_requests": requests,
                 "versions": [dict(v) | {"file_count": conn.execute("SELECT COUNT(*) FROM archive_files WHERE version_id=?", (v["id"],)).fetchone()[0],
                                          "copy_count": conn.execute("SELECT COUNT(*) FROM copies WHERE version_id=?", (v["id"],)).fetchone()[0]}
                              for v in versions],
@@ -497,8 +679,19 @@ class Handler(BaseHTTPRequestHandler):
             if parts[3] == "members":
                 d = self._body()
                 return self._send(201, store.grant(user, archive_id, d.get("user_id", ""), d.get("permission", "")))
+            if parts[3] == "holds":
+                d = self._body()
+                return self._send(201, store.register_hold(user, archive_id, d.get("reason", "")))
+            if parts[3] == "destruction-requests":
+                d = self._body()
+                return self._send(201, store.request_destruction(user, archive_id, d.get("reason", "")))
         if len(parts) == 4 and parts[:2] == ["api", "archives"] and parts[3] == "status" and method == "GET":
             return self._send(200, store.archive_status(user, int(parts[2])))
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "holds" and parts[3] == "revoke" and method == "POST":
+            d = self._body()
+            return self._send(200, store.revoke_hold(user, int(parts[2]), d.get("reason", "")))
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "destruction-requests" and parts[3] == "approve" and method == "POST":
+            return self._send(200, store.approve_destruction(user, int(parts[2])))
         if len(parts) == 3 and parts[:2] == ["api", "versions"] and method == "GET":
             return self._send(200, store.get_version(user, int(parts[2])))
         if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "copies" and method == "POST":

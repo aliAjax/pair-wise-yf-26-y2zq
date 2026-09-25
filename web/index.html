@@ -1,7 +1,163 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>数字档案长期保存</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}input,textarea,button,select{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:110px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin:12px 0}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}</style></head>
-<body><h1>数字档案长期保存</h1><p>演示账号：owner、archivist、auditor、outsider。请求使用 <code>X-User-Id</code>。</p>
-<section class="panel"><select id="user"><option>owner</option><option>archivist</option><option>auditor</option><option>outsider</option></select>
-<button onclick="loadStatus()">查看档案状态</button><pre id="out"></pre></section>
-<p>详细接口见 README。页面用于完成初始化后的状态检查，核心流程由 JSON API 提供。</p>
-<script>const out=document.querySelector("#out"),user=document.querySelector("#user");async function loadStatus(){const id=prompt("档案 ID","1");const r=await fetch(`/api/archives/${id}/status`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<style>
+body{font:16px system-ui;max-width:1000px;margin:32px auto;padding:0 16px;color:#222}
+input,textarea,button,select{font:inherit;padding:8px;margin:4px}
+textarea{width:100%;height:80px}
+.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin:12px 0}
+pre{background:#f4f4f4;padding:12px;white-space:pre-wrap;word-break:break-all}
+button{cursor:pointer;border-radius:6px;border:1px solid #888;background:#fff}
+button:hover{background:#eef}
+.badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:14px;margin-left:8px;color:#fff}
+.b-active{background:#2e7d32}.b-pending{background:#b26a00}.b-destroyed{background:#8e0000}.b-revoked{background:#777}
+.b-expired{background:#8e0000}.b-retained{background:#1565c0}
+table{border-collapse:collapse;width:100%;margin:8px 0}th,td{border:1px solid #ccc;padding:6px 8px;text-align:left;font-size:14px}
+.muted{color:#666;font-size:14px}
+</style></head>
+<body>
+<h1>数字档案长期保存</h1>
+<p>演示账号：owner（机构档案负责人）、archivist（档案管理员）、auditor（独立审计员）、outsider。请求使用 <code>X-User-Id</code>。</p>
+
+<section class="panel">
+  当前身份：<select id="user">
+    <option>owner</option><option>archivist</option><option>auditor</option><option>outsider</option>
+  </select>
+  <span class="muted">登记/撤销保全、销毁申请需 owner 或 archivist；审批销毁需 auditor 且有该档案读权限。</span>
+</section>
+
+<section class="panel">
+  <b>新建档案</b>（owner / archivist）
+  <div>名称 <input id="a_name" placeholder="档案名称">
+  保留期限 <input id="a_until" type="date">
+  <button onclick="createArchive()">创建</button></div>
+</section>
+
+<section class="panel">
+  <b>档案操作</b>　档案 ID <input id="archive_id" style="width:80px" placeholder="1">
+  <button onclick="loadStatus()">查看状态</button>
+  <button onclick="grantAccess()">授权访问</button>
+  <hr>
+  <div>保全事由/备注 <input id="h_reason" style="width:380px" placeholder="例如：诉讼保全（2026-行政-09）"></div>
+  <button onclick="registerHold()">登记保全</button>
+  <button onclick="revokeHold()">撤销保全</button>
+  <hr>
+  <button onclick="requestDestruction()">申请销毁</button>
+  <button onclick="approveDestruction()">审批销毁（auditor）</button>
+</section>
+
+<section id="summary" class="panel" style="display:none"></section>
+<section id="rawpanel" class="panel" style="display:none"><b>完整状态 JSON</b><pre id="out"></pre></section>
+
+<script>
+const $ = s => document.querySelector(s);
+const headers = extra => Object.assign({"X-User-Id": $("#user").value}, extra || {});
+async function call(method, url, body){
+  const opt = {method, headers: headers({"Content-Type":"application/json"})};
+  if (body !== undefined) opt.body = JSON.stringify(body);
+  const r = await fetch(url, opt);
+  return {status: r.status, data: await r.json().catch(() => ({}))};
+}
+async function act(method, url, body){
+  const {status, data} = await call(method, url, body);
+  if (data.error) alert(`操作失败（${status}）：${data.error.message}`);
+  else await loadStatus();
+  return data;
+}
+async function createArchive(){
+  const {status, data} = await call("POST","/api/archives",
+    {name:$("#a_name").value, retention_until:$("#a_until").value});
+  if (data.error){ alert(`创建失败（${status}）：${data.error.message}`); return; }
+  $("#archive_id").value = data.id;
+  await loadStatus();
+}
+function grantAccess(){
+  const id = $("#archive_id").value;
+  const uid = prompt("授权给谁（如 auditor）？","auditor");
+  if (!uid) return;
+  const perm = prompt("权限 read 或 write？","read");
+  if (!perm) return;
+  return act("POST", `/api/archives/${id}/members`, {user_id:uid, permission:perm});
+}
+function registerHold(){
+  const id = $("#archive_id").value, reason = $("#h_reason").value.trim();
+  if (!reason) return alert("请填写保全事由");
+  return act("POST", `/api/archives/${id}/holds`, {reason});
+}
+function revokeHold(){
+  const id = $("#archive_id").value;
+  const hid = prompt("要撤销的保全 ID（见下方保全记录）");
+  if (!hid) return;
+  return act("POST", `/api/holds/${hid}/revoke`, {reason:$("#h_reason").value.trim()});
+}
+function requestDestruction(){
+  const id = $("#archive_id").value;
+  return act("POST", `/api/archives/${id}/destruction-requests`, {reason:$("#h_reason").value.trim()});
+}
+function approveDestruction(){
+  const rid = prompt("要审批的销毁申请 ID（见下方销毁记录）");
+  if (!rid) return;
+  return act("POST", `/api/destruction-requests/${rid}/approve`);
+}
+function esc(s){return String(s ?? "").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+function badge(text, cls){return `<span class="badge ${cls}">${text}</span>`;}
+
+async function loadStatus(){
+  const id = $("#archive_id").value;
+  if (!id) return;
+  const {status, data} = await call("GET", `/api/archives/${id}/status`);
+  $("#out").textContent = JSON.stringify(data, null, 2);
+  if (data.error){ $("#summary").style.display="none"; $("#rawpanel").style.display=""; alert(data.error.message); return; }
+  $("#rawpanel").style.display = "";
+  const a = data.archive;
+  let html = `<h3 style="margin-top:0">${esc(a.name)}（ID ${a.id}）
+    ${badge({active:"在保",destruction_pending:"销毁待审批",destroyed:"已销毁"}[data.lifecycle],
+      {active:"b-active",destruction_pending:"b-pending",destroyed:"b-destroyed"}[data.lifecycle])}
+    ${badge(data.retention_expired?"保留期已届满":"保留期内", data.retention_expired?"b-expired":"b-retained")}</h3>`;
+  html += `<div>保留至 <b>${esc(a.retention_until)}</b>，剩余 ${data.days_remaining} 天；生效保全 <b>${data.active_hold_count}</b> 条。</div>`;
+
+  html += `<h4>保全记录</h4>`;
+  if (!data.holds.length) html += `<p class="muted">无</p>`;
+  else {
+    html += `<table><tr><th>ID</th><th>状态</th><th>事由</th><th>登记人/时间</th><th>撤销人/时间</th><th>撤销备注</th></tr>`;
+    for (const h of data.holds){
+      const active = !h.revoked_at;
+      html += `<tr><td>${h.id}</td><td>${badge(active?"生效":"已撤销",active?"b-active":"b-revoked")}</td>
+        <td>${esc(h.reason)}</td><td>${esc(h.registered_by)}<br><span class="muted">${esc(h.registered_at)}</span></td>
+        <td>${esc(h.revoked_by||"")}<br><span class="muted">${esc(h.revoked_at||"")}</span></td>
+        <td>${esc(h.revoke_reason)}</td></tr>`;
+    }
+    html += `</table>`;
+  }
+
+  html += `<h4>销毁申请记录</h4>`;
+  if (!data.destruction_requests.length) html += `<p class="muted">无</p>`;
+  else {
+    html += `<table><tr><th>ID</th><th>状态</th><th>申请人/时间</th><th>事由</th><th>审批人/时间</th></tr>`;
+    for (const r of data.destruction_requests){
+      const cls = r.status==="approved" ? "b-destroyed" : "b-pending";
+      html += `<tr><td>${r.id}</td><td>${badge(r.status==="approved"?"已批准销毁":"待审批",cls)}</td>
+        <td>${esc(r.requested_by)}<br><span class="muted">${esc(r.requested_at)}</span></td>
+        <td>${esc(r.reason)}</td>
+        <td>${esc(r.decided_by||"")}<br><span class="muted">${esc(r.decided_at||"")}</span></td></tr>`;
+    }
+    html += `</table>`;
+  }
+
+  html += `<h4>版本与副本（批准销毁后内容与副本被清空）</h4><table><tr><th>版本</th><th>校验状态</th><th>文件数</th><th>副本数</th></tr>`;
+  for (const v of data.versions){
+    html += `<tr><td>${v.version}</td><td>${esc(v.state)}</td><td>${v.file_count}</td><td>${v.copy_count}</td></tr>`;
+  }
+  html += `</table>`;
+
+  html += `<h4>处置与保全变动审计（留存）</h4><table><tr><th>时间</th><th>操作人</th><th>动作</th><th>详情</th></tr>`;
+  for (const e of data.audit){
+    if (!e.action.startsWith("hold.") && !e.action.startsWith("destruction.")) continue;
+    html += `<tr><td>${esc(e.created_at)}</td><td>${esc(e.actor_id)}</td><td>${esc(e.action)}</td>
+      <td><code>${esc(JSON.stringify(e.detail))}</code></td></tr>`;
+  }
+  html += `</table>`;
+
+  $("#summary").style.display = "";
+  $("#summary").innerHTML = html;
+}
+</script>
+</body></html>
