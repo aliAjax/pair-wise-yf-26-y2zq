@@ -1,7 +1,35 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>数字档案长期保存</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}input,textarea,button,select{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:110px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin:12px 0}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}</style></head>
+<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}input,textarea,button,select{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:110px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin:12px 0}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}input[type=number]{width:6em}</style></head>
 <body><h1>数字档案长期保存</h1><p>演示账号：owner、archivist、auditor、outsider。请求使用 <code>X-User-Id</code>。</p>
 <section class="panel"><select id="user"><option>owner</option><option>archivist</option><option>auditor</option><option>outsider</option></select>
+档案 ID <input id="aid" type="number" value="1" min="1">
 <button onclick="loadStatus()">查看档案状态</button><pre id="out"></pre></section>
-<p>详细接口见 README。页面用于完成初始化后的状态检查，核心流程由 JSON API 提供。</p>
-<script>const out=document.querySelector("#out"),user=document.querySelector("#user");async function loadStatus(){const id=prompt("档案 ID","1");const r=await fetch(`/api/archives/${id}/status`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<section class="panel"><b>保全</b>（负责人/档案管理员登记或撤销，需写权限）<br>
+原因 <input id="holdReason" placeholder="如：诉讼保全">
+<button onclick="registerHold()">登记保全</button>
+保全 ID <input id="holdId" type="number" min="1">
+<button onclick="revokeHold()">撤销保全</button></section>
+<section class="panel"><b>销毁</b>（申请：负责人/档案管理员；审批：审计员，需档案访问权限）<br>
+原因 <input id="destroyReason" placeholder="如：保留期满，鉴定销毁">
+<button onclick="requestDestruction()">申请销毁</button>
+申请 ID <input id="reqId" type="number" min="1">
+<button onclick="approveDestruction()">审批销毁</button></section>
+<p>销毁规则：保留期限到期前不受理；有生效保全时拒绝申请；待审批期间新登记保全会让审批失败。批准后清空档案内容与副本，处置与保全变动记录保留在审计日志。其余接口见 README。</p>
+<script>
+const out=document.querySelector("#out"),user=document.querySelector("#user"),aid=document.querySelector("#aid");
+const holdReason=document.querySelector("#holdReason"),holdId=document.querySelector("#holdId");
+const destroyReason=document.querySelector("#destroyReason"),reqId=document.querySelector("#reqId");
+async function call(method,url,body){const r=await fetch(url,{method,headers:{"X-User-Id":user.value,"Content-Type":"application/json"},body:body?JSON.stringify(body):undefined});return r.json()}
+function show(j){
+  if(j.error){out.textContent=JSON.stringify(j,null,2);return}
+  const holds=(j.holds||[]).map(h=>`#${h.id} ${h.status==="active"?"生效":"已撤销"} ${h.reason}`).join("；")||"无";
+  const reqs=(j.destruction_requests||[]).map(r=>`#${r.id} ${r.status==="pending"?"待审批":"已批准"}`).join("；")||"无";
+  out.textContent=`当前状态：${j.destroyed?"已销毁":"在库"} ｜ 保留期限：${j.archive.retention_until}（剩余 ${j.days_remaining} 天） ｜ 保全：${holds} ｜ 销毁申请：${reqs}\n\n`+JSON.stringify(j,null,2);
+}
+async function loadStatus(){show(await call("GET",`/api/archives/${aid.value}/status`))}
+async function run(p){const j=await p;if(j.error){show(j)}else{await loadStatus()}}
+function registerHold(){run(call("POST",`/api/archives/${aid.value}/holds`,{reason:holdReason.value}))}
+function revokeHold(){run(call("POST",`/api/holds/${holdId.value}/revoke`))}
+function requestDestruction(){run(call("POST",`/api/archives/${aid.value}/destruction-requests`,{reason:destroyReason.value}))}
+function approveDestruction(){run(call("POST",`/api/destruction-requests/${reqId.value}/approve`))}
+</script></body></html>
